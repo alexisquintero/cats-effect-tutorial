@@ -1,32 +1,33 @@
 package Files
 
-import cats.effect.{ IO, Resource, Concurrent, IOApp, ExitCode }
+import cats.effect.{ Resource, Concurrent, IOApp, ExitCode, Sync }
 import java.io.{ File, FileInputStream, FileOutputStream, InputStream, OutputStream }
 import cats.effect.concurrent.Semaphore
+import cats.syntax.applicativeError._
 
 object Resources {
-  def inputStream(f: File, guard: Semaphore[IO]): Resource[IO, FileInputStream] =
+  def inputStream[F[_]: Sync](f: File, guard: Semaphore[F]): Resource[F, FileInputStream] =
     Resource.make {
-      IO(new FileInputStream(f))
+      Sync[F].delay(new FileInputStream(f))
     } { inStream =>
       guard.withPermit {
-        IO(inStream.close()).handleErrorWith(_ => IO.unit)
+        Sync[F].delay(inStream.close()).handleErrorWith(_ => Sync[F].unit)
       }
     }
 
   // def inputStream(f: File): Resource[IO, FileInputStream] =
   //   Resource.fromAutoCloseable(IO(new FileInputStream(f)))
 
-  def outputStream(f: File, guard: Semaphore[IO]): Resource[IO, FileOutputStream] =
+  def outputStream[F[_]: Sync](f: File, guard: Semaphore[F]): Resource[F, FileOutputStream] =
     Resource.make {
-      IO(new FileOutputStream(f))
+      Sync[F].delay(new FileOutputStream(f))
     } { outStream =>
       guard.withPermit {
-        IO(outStream.close()).handleErrorWith(_ => IO.unit)
+        Sync[F].delay(outStream.close()).handleErrorWith(_ => Sync[F].unit)
       }
     }
 
-  def inputOutputStream(in: File, out: File, guard: Semaphore[IO]): Resource[IO, (InputStream, OutputStream)] =
+  def inputOutputStream[F[_]: Sync](in: File, out: File, guard: Semaphore[F]): Resource[F, (InputStream, OutputStream)] =
     for {
       inStream <- inputStream(in, guard)
       outStream <- outputStream(out, guard)
@@ -36,23 +37,24 @@ object Resources {
 object Copy {
   import Resources._
   import cats.syntax.flatMap._
+  import cats.syntax.functor._
 
-  def transmit(origin: InputStream, destination: OutputStream, buffer: Array[Byte], acc: Long): IO[Long] =
+  def transmit[F[_]: Sync](origin: InputStream, destination: OutputStream, buffer: Array[Byte], acc: Long): F[Long] =
     for {
-      amount <- IO(origin.read(buffer, 0, buffer.size))
-      count <- if(amount > -1) IO(destination.write(buffer, 0, amount)) >> transmit(origin, destination, buffer, acc + amount)
-        else IO.pure(acc)
+      amount <- Sync[F].pure(origin.read(buffer, 0, buffer.size))
+      count <- if(amount > -1) Sync[F].pure(destination.write(buffer, 0, amount)) >> transmit(origin, destination, buffer, acc + amount)
+        else Sync[F].pure(acc)
     } yield count
 
-  def transfer(origin: InputStream, destination: OutputStream): IO[Long] =
+  def transfer[F[_]: Sync](origin: InputStream, destination: OutputStream): F[Long] =
     for {
-      buffer <- IO(new Array[Byte](1024 * 10))
+      buffer <- Sync[F].delay(new Array[Byte](1024 * 10))
       total <- transmit(origin, destination, buffer, 0L)
     } yield total
 
-  def copy(origin: File, destination: File)(implicit concurrent: Concurrent[IO]): IO[Long] =
+  def copy[F[_]: Concurrent](origin: File, destination: File): F[Long] =
     for {
-      guard <- Semaphore[IO](1)
+      guard <- Semaphore[F](1)
       count <- inputOutputStream(origin, destination, guard).use { case (in, out) =>
         guard.withPermit(transfer(in, out))
       }
@@ -81,6 +83,7 @@ object Copy {
 
 object Main extends IOApp {
   import Copy.copy
+  import cats.effect.IO
 
   override def run(args: List[String]): IO[ExitCode] =
     for {
@@ -88,7 +91,7 @@ object Main extends IOApp {
         else IO.unit
       orig = new File(args(0))
       dest = new File(args(1))
-      count <- copy(orig, dest)
+      count <- copy[IO](orig, dest)
       _ <- IO(println(s"$count bytes copied from ${orig.getPath} to ${dest.getPath}"))
     } yield ExitCode.Success
 }

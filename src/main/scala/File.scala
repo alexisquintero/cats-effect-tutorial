@@ -52,26 +52,24 @@ object Copy {
       total <- transmit(origin, destination, buffer, 0L)
     } yield total
 
-  def checkFile[F[_]: Sync](file: File): F[Unit] = { // ???
-    import java.nio.file.{ Paths, Files }
+  def overwriteConfirmation[F[_]: Sync](file: File): F[Boolean] = {
     import scala.io.StdIn
 
-    for {
-      exists <- Sync[F].delay(Files.exists(Paths.get(file.getPath)))
-      outcome = if (exists) {
-        for {
-          _ <- Sync[F].delay(Console.println(s"File ${file.getName} already exists, overwrite?"))
-          ans <- Sync[F].delay(StdIn.readLine)
-        } yield if (ans != "Y") Sync[F].raiseError(new Error("Can't overwrite destination"))
-        else Sync[F].unit
-      } else Sync[F].unit
-    } yield Sync[F].unit
+    if (file.exists)
+      for {
+        _ <- Sync[F].delay(Console.println(s"File ${file.getName} already exists, overwrite?"))
+        ans <- Sync[F].delay(StdIn.readLine)
+      } yield ans == "Y"
+    else Sync[F].pure(true)
   }
 
   def copy[F[_]: Concurrent](origin: File, destination: File): F[Long] =
     for {
-      _ <- if (origin == destination) Sync[F].raiseError(new IllegalArgumentException("Origin and destination can't be the same")) else Sync[F].unit
-      // _ <- checkFile(destination)
+      _ <- if (origin == destination) Sync[F].raiseError(new IllegalArgumentException("Origin and destination can't be the same"))
+           else Sync[F].unit
+      overwriteCheck <- overwriteConfirmation(destination)
+      _ <- if (overwriteCheck) Sync[F].unit
+           else Sync[F].raiseError(new IllegalArgumentException("Can't overwrite destination"))
       guard <- Semaphore[F](1)
       count <- inputOutputStream(origin, destination, guard).use { case (in, out) =>
         guard.withPermit(transfer(in, out))

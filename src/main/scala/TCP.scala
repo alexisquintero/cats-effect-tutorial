@@ -1,6 +1,6 @@
 package TCP
 
-import cats.effect.{ Sync, Resource, Concurrent, IOApp, ExitCode, IO, ExitCase, ContextShift }
+import cats.effect.{ Sync, Resource, Concurrent, IOApp, ExitCode, IO, ExitCase, ContextShift, Async }
 import cats.effect.concurrent.MVar
 import ExitCase.{ Completed, Canceled, Error }
 
@@ -9,19 +9,26 @@ import cats.syntax.functor._
 import cats.syntax.applicativeError._
 
 import scala.concurrent.{ ExecutionContext, ExecutionContextExecutor }
+import scala.util.Try
 
 import java.net.{ Socket, ServerSocket }
 import java.io.{ BufferedReader, BufferedWriter, InputStreamReader, PrintWriter }
 import java.util.concurrent.{ Executors, ExecutorService }
 
 object TCP {
-  def echoProtocol[F[_]: Sync: ContextShift](clientSocket: Socket, stopFlag: MVar[F, Unit])
+  def echoProtocol[F[_]: Async](clientSocket: Socket, stopFlag: MVar[F, Unit])
     (implicit clientsExecutionContext: ExecutionContext): F[Unit] = {
 
     def loop(reader: BufferedReader, writer: BufferedWriter, stopFlag: MVar[F, Unit]): F[Unit] =
       for {
-        lineE <- ContextShift[F]
-                  .evalOn(clientsExecutionContext)(Sync[F].delay(reader.readLine).attempt)
+        lineE <- Async[F].async { (cb: Either[Throwable, Either[Throwable, String]] => Unit) =>
+                  clientsExecutionContext.execute(new Runnable {
+                    override def run(): Unit = {
+                      val result: Either[Throwable, String] = Try(reader.readLine).toEither
+                      cb(Right(result))
+                    }
+                  })
+                 }
         _    <- lineE match {
                   case Right(line) => line match {
                     case "STOP" => stopFlag.put(())

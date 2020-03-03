@@ -13,18 +13,26 @@ import cats.effect.{ExitCode, IO}
 object TCP {
   def echoProtocol[F[_]: Sync](clientSocket: Socket, stopFlag: MVar[F, Unit]): F[Unit] = {
 
-    def loop(reader: BufferedReader, writer: BufferedWriter): F[Unit] =
+    def loop(reader: BufferedReader, writer: BufferedWriter, stopFlag: MVar[F, Unit]): F[Unit] =
       for {
-        line <- Sync[F].delay(reader.readLine)
-        _    <- line match {
-                  case "STOP" => stopFlag.put(())
-                  case "" => Sync[F].unit
-                  case _ => Sync[F].delay {
-                    writer.write(line)
-                    writer.newLine
-                    writer.flush
-                  } >> loop(reader, writer)
-        }
+        lineE <- Sync[F].delay(reader.readLine).attempt
+        _    <- lineE match {
+                  case Right(line) => line match {
+                    case "STOP" => stopFlag.put(())
+                    case "" => Sync[F].unit
+                    case _ => Sync[F].delay {
+                      writer.write(line)
+                      writer.newLine
+                      writer.flush
+                    } >> loop(reader, writer, stopFlag)
+                  }
+                  case Left(e) =>
+                    for {
+                      isEmpty <- stopFlag.isEmpty
+                      _ <- if(!isEmpty) Sync[F].unit
+                           else Sync[F].raiseError(e)
+                    } yield ()
+                }
       } yield ()
 
     def reader(clientSocket: Socket): Resource[F, BufferedReader] =
@@ -54,7 +62,7 @@ object TCP {
       } yield (reader, writer)
 
     readerWriter(clientSocket).use { case (reader, writer) =>
-      loop(reader, writer)
+      loop(reader, writer, stopFlag)
     }
   }
 
@@ -65,16 +73,18 @@ object TCP {
       Sync[F].delay(socket.close).handleErrorWith(_ => Sync[F].unit)
 
     for {
-      _ <- Sync[F]
-            .delay(serverSocket.accept)
-            .bracketCase { socket =>
-              echoProtocol(socket, stopFlag)
-                .guarantee(close(socket))
-                .start
-            } { (socket, exit) => exit match {
-              case Completed => Sync[F].unit
-              case Error(_) | Canceled => close(socket)
-            }}
+      fiber <- Sync[F]
+                  .delay(serverSocket.accept)
+                  .bracketCase { socket =>
+                    echoProtocol(socket, stopFlag)
+                      .guarantee(close(socket))
+                      .start
+                  } { (socket, exit) => exit match {
+                    case Completed => Sync[F].unit
+                    case Error(_) | Canceled => close(socket)
+                  }}
+      _ <- (stopFlag.read >> fiber.cancel)
+              .start
       _ <- serve(serverSocket, stopFlag)
     } yield ()
   }

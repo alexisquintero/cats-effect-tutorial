@@ -1,6 +1,7 @@
 package TCP
 
 import cats.effect.{ Sync, Resource, Concurrent, IOApp }
+import cats.effect.concurrent.MVar
 import java.net.{ Socket, ServerSocket }
 import java.io.{ BufferedReader, BufferedWriter, InputStreamReader, PrintWriter }
 import cats.syntax.flatMap._
@@ -10,12 +11,13 @@ import cats.effect.ExitCase.{ Completed, Canceled, Error }
 import cats.effect.{ExitCode, IO}
 
 object TCP {
-  def echoProtocol[F[_]: Sync](clientSocket: Socket): F[Unit] = {
+  def echoProtocol[F[_]: Sync](clientSocket: Socket, stopFlag: MVar[F, Unit]): F[Unit] = {
 
     def loop(reader: BufferedReader, writer: BufferedWriter): F[Unit] =
       for {
         line <- Sync[F].delay(reader.readLine)
         _    <- line match {
+                  case "STOP" => stopFlag.put(())
                   case "" => Sync[F].unit
                   case _ => Sync[F].delay {
                     writer.write(line)
@@ -56,7 +58,7 @@ object TCP {
     }
   }
 
-  def serve[F[_]: Concurrent](serverSocket: ServerSocket): F[Unit] = {
+  def serve[F[_]: Concurrent](serverSocket: ServerSocket, stopFlag: MVar[F, Unit]): F[Unit] = {
     import cats.effect.syntax.all._
 
     def close(socket: Socket): F[Unit] =
@@ -66,20 +68,32 @@ object TCP {
       _ <- Sync[F]
             .delay(serverSocket.accept)
             .bracketCase { socket =>
-              echoProtocol(socket)
+              echoProtocol(socket, stopFlag)
                 .guarantee(close(socket))
                 .start
             } { (socket, exit) => exit match {
               case Completed => Sync[F].unit
               case Error(_) | Canceled => close(socket)
             }}
-      _ <- serve(serverSocket)
+      _ <- serve(serverSocket, stopFlag)
     } yield ()
+  }
+
+
+  def server[F[_]: Concurrent](serverSocket: ServerSocket): F[ExitCode] = {
+    import cats.effect.syntax.all._
+
+    for {
+      stopFlag <- MVar[F].empty[Unit]
+      serverFiber <- serve(serverSocket, stopFlag).start
+      _ <- stopFlag.read
+      _ <- serverFiber.cancel.start
+    } yield ExitCode.Success
   }
 }
 
 object Main extends IOApp {
-  import TCP.serve
+  import TCP.server
 
   def run(args: List[String]): IO[ExitCode] = {
     def close[F[_]: Sync](socket: ServerSocket): F[Unit] =
@@ -87,7 +101,7 @@ object Main extends IOApp {
 
     IO(new ServerSocket(args.headOption.map(_.toInt).getOrElse(5432)))
       .bracket {
-        serverSocket => serve[IO](serverSocket) >> IO.pure(ExitCode.Success)
+        serverSocket => server[IO](serverSocket) >> IO.pure(ExitCode.Success)
       } {
         serverSocket => close[IO](serverSocket) >> IO(println("Server finished"))
       }

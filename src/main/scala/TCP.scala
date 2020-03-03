@@ -1,21 +1,27 @@
 package TCP
 
-import cats.effect.{ Sync, Resource, Concurrent, IOApp }
+import cats.effect.{ Sync, Resource, Concurrent, IOApp, ExitCode, IO, ExitCase, ContextShift }
 import cats.effect.concurrent.MVar
-import java.net.{ Socket, ServerSocket }
-import java.io.{ BufferedReader, BufferedWriter, InputStreamReader, PrintWriter }
+import ExitCase.{ Completed, Canceled, Error }
+
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 import cats.syntax.applicativeError._
-import cats.effect.ExitCase.{ Completed, Canceled, Error }
-import cats.effect.{ExitCode, IO}
+
+import scala.concurrent.{ ExecutionContext, ExecutionContextExecutor }
+
+import java.net.{ Socket, ServerSocket }
+import java.io.{ BufferedReader, BufferedWriter, InputStreamReader, PrintWriter }
+import java.util.concurrent.{ Executors, ExecutorService }
 
 object TCP {
-  def echoProtocol[F[_]: Sync](clientSocket: Socket, stopFlag: MVar[F, Unit]): F[Unit] = {
+  def echoProtocol[F[_]: Sync: ContextShift](clientSocket: Socket, stopFlag: MVar[F, Unit])
+    (implicit clientsExecutionContext: ExecutionContext): F[Unit] = {
 
     def loop(reader: BufferedReader, writer: BufferedWriter, stopFlag: MVar[F, Unit]): F[Unit] =
       for {
-        lineE <- Sync[F].delay(reader.readLine).attempt
+        lineE <- ContextShift[F]
+                  .evalOn(clientsExecutionContext)(Sync[F].delay(reader.readLine).attempt)
         _    <- lineE match {
                   case Right(line) => line match {
                     case "STOP" => stopFlag.put(())
@@ -66,7 +72,12 @@ object TCP {
     }
   }
 
-  def serve[F[_]: Concurrent](serverSocket: ServerSocket, stopFlag: MVar[F, Unit]): F[Unit] = {
+  def serve[F[_]: Concurrent: ContextShift](
+    serverSocket: ServerSocket,
+    stopFlag: MVar[F, Unit]
+  )(
+    implicit clientsExecutionContext: ExecutionContext
+  ): F[Unit] = {
     import cats.effect.syntax.all._
 
     def close(socket: Socket): F[Unit] =
@@ -90,13 +101,18 @@ object TCP {
   }
 
 
-  def server[F[_]: Concurrent](serverSocket: ServerSocket): F[ExitCode] = {
+  def server[F[_]: Concurrent: ContextShift](serverSocket: ServerSocket): F[ExitCode] = {
     import cats.effect.syntax.all._
+
+    val clientsThreadPool: ExecutorService = Executors.newCachedThreadPool
+    implicit val clientsExecutionContext: ExecutionContextExecutor =
+      ExecutionContext.fromExecutor(clientsThreadPool)
 
     for {
       stopFlag <- MVar[F].empty[Unit]
       serverFiber <- serve(serverSocket, stopFlag).start
       _ <- stopFlag.read
+      _ <- Sync[F].delay(clientsThreadPool.shutdown)
       _ <- serverFiber.cancel.start
     } yield ExitCode.Success
   }
